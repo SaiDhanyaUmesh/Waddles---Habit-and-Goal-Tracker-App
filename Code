@@ -1,0 +1,909 @@
+package com.example.waddles
+
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.room.*
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.time.DayOfWeek
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.util.*
+import java.util.concurrent.TimeUnit
+import kotlin.random.Random
+
+// --- Room Database & Entities ---
+
+enum class Category { Fitness, Learning, Hobbies, Miscellaneous }
+
+fun getCategoryColor(category: Category): Color = when (category) {
+    Category.Fitness -> Color(0xFFEF4444)
+    Category.Learning -> Color(0xFF3B82F6)
+    Category.Hobbies -> Color(0xFF10B981)
+    Category.Miscellaneous -> Color(0xFF9CA3AF)
+}
+
+@Entity(tableName = "tasks")
+data class Task(@PrimaryKey val id: String = UUID.randomUUID().toString(), val text: String, val completed: Boolean = false, val category: Category, val date: String, val learningItemId: String? = null, val learningUnits: Int = 1)
+
+@Entity(tableName = "learning_items")
+data class LearningItem(@PrimaryKey val id: String = UUID.randomUUID().toString(), val title: String, val totalUnits: Int, val completedUnits: Int = 0, val type: String, val category: Category? = Category.Learning, val deadline: String? = null)
+
+@Entity(tableName = "time_logs")
+data class TimeLog(@PrimaryKey val id: String = UUID.randomUUID().toString(), val date: String, val category: Category, val hours: Float)
+
+@Entity(tableName = "habits")
+data class Habit(@PrimaryKey val id: String = UUID.randomUUID().toString(), val name: String, val completedDates: Set<String> = emptySet())
+
+class Converters {
+    private val gson = Gson()
+    @TypeConverter fun fromCategory(category: Category?): String? = category?.name
+    @TypeConverter fun toCategory(name: String?): Category? = name?.let { Category.valueOf(it) }
+    @TypeConverter fun fromStringSet(set: Set<String>): String = gson.toJson(set)
+    @TypeConverter fun toStringSet(data: String): Set<String> = gson.fromJson(data, object : TypeToken<Set<String>>() {}.type)
+}
+
+@Dao
+interface WaddlesDao {
+    @Query("SELECT * FROM tasks") fun getTasks(): Flow<List<Task>>
+    @Query("SELECT * FROM tasks WHERE id = :id") suspend fun getTaskById(id: String): Task?
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertTask(task: Task)
+    @Update suspend fun updateTask(task: Task)
+    @Query("DELETE FROM tasks WHERE id = :id") suspend fun deleteTask(id: String)
+
+    @Query("SELECT * FROM learning_items") fun getLearningItems(): Flow<List<LearningItem>>
+    @Query("SELECT * FROM learning_items WHERE id = :id") suspend fun getLearningItemById(id: String): LearningItem?
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertLearningItem(item: LearningItem)
+    @Update suspend fun updateLearningItem(item: LearningItem)
+
+    @Query("SELECT * FROM time_logs") fun getTimeLogs(): Flow<List<TimeLog>>
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertTimeLog(log: TimeLog)
+
+    @Query("SELECT * FROM habits") fun getHabits(): Flow<List<Habit>>
+    @Query("SELECT * FROM habits WHERE id = :id") suspend fun getHabitById(id: String): Habit?
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertHabit(habit: Habit)
+    @Update suspend fun updateHabit(habit: Habit)
+    @Query("DELETE FROM habits WHERE id = :id") suspend fun deleteHabit(id: String)
+}
+
+@Database(entities = [Task::class, LearningItem::class, TimeLog::class, Habit::class], version = 1, exportSchema = false)
+@TypeConverters(Converters::class)
+abstract class WaddlesDatabase : RoomDatabase() {
+    abstract fun waddlesDao(): WaddlesDao
+    companion object {
+        @Volatile private var INSTANCE: WaddlesDatabase? = null
+        fun getDatabase(context: Context): WaddlesDatabase = INSTANCE ?: synchronized(this) {
+            Room.databaseBuilder(context.applicationContext, WaddlesDatabase::class.java, "waddles_db").build().also { INSTANCE = it }
+        }
+    }
+}
+
+// --- ViewModel ---
+
+class WaddlesViewModel(private val dao: WaddlesDao) : ViewModel() {
+    val tasks: StateFlow<List<Task>> = dao.getTasks().stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    val learningItems: StateFlow<List<LearningItem>> = dao.getLearningItems().stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    val timeLogs: StateFlow<List<TimeLog>> = dao.getTimeLogs().stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    val habits: StateFlow<List<Habit>> = dao.getHabits().stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    var isTimerRunning by mutableStateOf(false)
+        private set
+    var elapsedSeconds by mutableLongStateOf(0L)
+        private set
+    var activeTaskId by mutableStateOf<String?>(null)
+    var activeTimerCategory by mutableStateOf(Category.Learning)
+    var isPomodoro by mutableStateOf(false)
+
+    private var startTime = 0L
+    private var accumulatedTime = 0L
+    private var timerJob: Job? = null
+
+    fun toggleTimer(start: Boolean, context: Context) {
+        isTimerRunning = start
+        if (start) {
+            startTime = System.currentTimeMillis()
+            timerJob = viewModelScope.launch {
+                while (isActive) {
+                    val now = System.currentTimeMillis()
+                    elapsedSeconds = accumulatedTime + (now - startTime) / 1000
+                    if (isPomodoro && elapsedSeconds >= 1500L) {
+                        isTimerRunning = false
+                        sendSassyWaddlesNotification(context, 100, 5)
+                        timerJob?.cancel()
+                    }
+                    delay(500)
+                }
+            }
+        } else {
+            accumulatedTime = elapsedSeconds
+            timerJob?.cancel()
+        }
+    }
+
+    fun resetTimer() {
+        timerJob?.cancel()
+        isTimerRunning = false
+        accumulatedTime = 0L
+        elapsedSeconds = 0L
+        activeTaskId = null
+    }
+
+    fun toggleTask(taskId: String) {
+        viewModelScope.launch {
+            val task = dao.getTaskById(taskId) ?: return@launch
+            val newCompleted = !task.completed
+            if (task.learningItemId != null && task.learningUnits > 0) {
+                val item = dao.getLearningItemById(task.learningItemId)
+                if (item != null) {
+                    val change = if (newCompleted) task.learningUnits else -task.learningUnits
+                    dao.updateLearningItem(item.copy(completedUnits = (item.completedUnits + change).coerceAtLeast(0)))
+                }
+            }
+            dao.updateTask(task.copy(completed = newCompleted))
+        }
+    }
+
+    fun addTask(text: String, category: Category, date: String, learningId: String?, units: Int) {
+        if (text.isNotBlank()) viewModelScope.launch { dao.insertTask(Task(text = text, category = category, date = date, learningItemId = learningId, learningUnits = units)) }
+    }
+
+    fun deleteTask(id: String) {
+        viewModelScope.launch {
+            val task = dao.getTaskById(id)
+            if (task != null && task.completed && task.learningItemId != null && task.learningUnits > 0) {
+                val item = dao.getLearningItemById(task.learningItemId)
+                if (item != null) dao.updateLearningItem(item.copy(completedUnits = (item.completedUnits - task.learningUnits).coerceAtLeast(0)))
+            }
+            dao.deleteTask(id)
+        }
+    }
+
+    fun addTimeLog(category: Category, hours: Float) {
+        viewModelScope.launch { dao.insertTimeLog(TimeLog(date = getTodayStr(), category = category, hours = hours)) }
+    }
+
+    fun addLearningItem(title: String, total: Int, type: String, cat: Category, deadline: String?) {
+        viewModelScope.launch { dao.insertLearningItem(LearningItem(title = title, totalUnits = total, type = type, category = cat, deadline = deadline)) }
+    }
+
+    fun addLearningProgress(itemId: String) {
+        viewModelScope.launch { val item = dao.getLearningItemById(itemId); if (item != null && item.completedUnits < item.totalUnits) dao.updateLearningItem(item.copy(completedUnits = item.completedUnits + 1)) }
+    }
+
+    fun addHabit(name: String) {
+        if (name.isNotBlank()) viewModelScope.launch { dao.insertHabit(Habit(name = name)) }
+    }
+
+    fun toggleHabit(habitId: String, dateStr: String) {
+        viewModelScope.launch { val h = dao.getHabitById(habitId); if (h != null) { val newDates = if (h.completedDates.contains(dateStr)) h.completedDates - dateStr else h.completedDates + dateStr; dao.updateHabit(h.copy(completedDates = newDates)) } }
+    }
+
+    fun deleteHabit(id: String) { viewModelScope.launch { dao.deleteHabit(id) } }
+}
+
+class WaddlesViewModelFactory(private val dao: WaddlesDao) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(WaddlesViewModel::class.java)) @Suppress("UNCHECKED_CAST") return WaddlesViewModel(dao) as T
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
+// --- Entry Point & Worker ---
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val workRequest = PeriodicWorkRequestBuilder<WaddlesWorker>(2, TimeUnit.HOURS).build()
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork("WaddlesRoutineTracker", ExistingPeriodicWorkPolicy.KEEP, workRequest)
+
+        val database = WaddlesDatabase.getDatabase(this)
+
+        setContent {
+            val viewModel: WaddlesViewModel = viewModel(factory = WaddlesViewModelFactory(database.waddlesDao()))
+            WaddlesApp(viewModel)
+        }
+    }
+}
+
+class WaddlesWorker(appContext: Context, workerParams: WorkerParameters) : CoroutineWorker(appContext, workerParams) {
+    override suspend fun doWork(): Result {
+        val dao = WaddlesDatabase.getDatabase(applicationContext).waddlesDao()
+        val tasks = dao.getTasks().first()
+        val habits = dao.getHabits().first()
+
+        val todayStr = LocalDate.now().toString()
+        val dailyTasks = tasks.filter { it.date == todayStr }
+        val progress = if (dailyTasks.isEmpty()) 0 else (dailyTasks.count { it.completed } * 100 / dailyTasks.size)
+        val maxStreak = habits.maxOfOrNull { calculateHabitStreak(it.completedDates) } ?: 0
+
+        val currentHour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        if (currentHour in 8..21) sendSassyWaddlesNotification(applicationContext, progress, maxStreak)
+        return Result.success()
+    }
+}
+
+// --- Helpers & Theme ---
+
+val ComicSansFont = FontFamily(Font(R.font.comic_sans))
+private val defaultTypography = Typography()
+val ComicSansTypography = Typography(
+    displayLarge = defaultTypography.displayLarge.copy(fontFamily = ComicSansFont),
+    displayMedium = defaultTypography.displayMedium.copy(fontFamily = ComicSansFont),
+    displaySmall = defaultTypography.displaySmall.copy(fontFamily = ComicSansFont),
+    headlineLarge = defaultTypography.headlineLarge.copy(fontFamily = ComicSansFont),
+    headlineMedium = defaultTypography.headlineMedium.copy(fontFamily = ComicSansFont),
+    headlineSmall = defaultTypography.headlineSmall.copy(fontFamily = ComicSansFont),
+    titleLarge = defaultTypography.titleLarge.copy(fontFamily = ComicSansFont),
+    titleMedium = defaultTypography.titleMedium.copy(fontFamily = ComicSansFont),
+    titleSmall = defaultTypography.titleSmall.copy(fontFamily = ComicSansFont),
+    bodyLarge = defaultTypography.bodyLarge.copy(fontFamily = ComicSansFont),
+    bodyMedium = defaultTypography.bodyMedium.copy(fontFamily = ComicSansFont),
+    bodySmall = defaultTypography.bodySmall.copy(fontFamily = ComicSansFont),
+    labelLarge = defaultTypography.labelLarge.copy(fontFamily = ComicSansFont),
+    labelMedium = defaultTypography.labelMedium.copy(fontFamily = ComicSansFont),
+    labelSmall = defaultTypography.labelSmall.copy(fontFamily = ComicSansFont)
+)
+
+@Composable
+fun WaddlesTheme(content: @Composable () -> Unit) { MaterialTheme(typography = ComicSansTypography, content = content) }
+
+data class Quote(val text: String, val author: String)
+val MOTIVATIONAL_QUOTES = listOf(
+    Quote("You have a right to perform your prescribed duty, but you are not entitled to the fruits of action.", "Bhagavad Gita"),
+    Quote("The two most powerful warriors are patience and time.", "Leo Tolstoy"),
+    Quote("The journey of a thousand miles begins with a single step.", "Lao Tzu"),
+    Quote("To go wrong in one's own way is better than to go right in someone else's.", "Fyodor Dostoevsky"),
+    Quote("It does not matter how slowly you go as long as you do not stop.", "Confucius"),
+    Quote("Knowledge is of no value unless you put it into practice.", "Anton Chekhov"),
+    Quote("A man is made by his belief. As he believes, so he is.", "Bhagavad Gita")
+)
+fun getTodayStr(): String = LocalDate.now().toString()
+fun getDayName(dateStr: String): String = try { LocalDate.parse(dateStr).dayOfWeek.name.lowercase().replaceFirstChar { it.uppercase() } } catch(e:Exception){ "Backlog" }
+fun getDatesOfCurrentWeek(): List<String> { var sunday = LocalDate.now(); while (sunday.dayOfWeek != DayOfWeek.SUNDAY) sunday = sunday.minusDays(1); return (0..6).map { sunday.plusDays(it.toLong()).toString() } }
+fun formatTime(seconds: Long): String = String.format(Locale.getDefault(), "%02d:%02d:%02d", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+fun calculateHabitStreak(completedDates: Set<String>): Int { if (completedDates.isEmpty()) return 0; val today = LocalDate.now(); val yesterday = today.minusDays(1); if (!completedDates.contains(today.toString()) && !completedDates.contains(yesterday.toString())) return 0; var streak = 0; var currentDate = if (completedDates.contains(today.toString())) today else yesterday; while (completedDates.contains(currentDate.toString())) { streak++; currentDate = currentDate.minusDays(1) }; return streak }
+
+fun getDaysRemaining(deadlineStr: String?): String? {
+    if (deadlineStr.isNullOrBlank()) return null
+    return try {
+        val deadline = LocalDate.parse(deadlineStr)
+        val today = LocalDate.now()
+        val diff = java.time.temporal.ChronoUnit.DAYS.between(today, deadline)
+        when {
+            diff < 0 -> "Overdue by ${kotlin.math.abs(diff)} days"
+            diff == 0L -> "Due Today!"
+            else -> "$diff days left"
+        }
+    } catch (e: Exception) { null }
+}
+
+fun sendSassyWaddlesNotification(context: Context, progress: Int, maxStreak: Int) {
+    val channelId = "waddles_wav_channel_v1"
+    val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val soundUri = Uri.parse("android.resource://${context.packageName}/${R.raw.quack}")
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val channel = NotificationChannel(channelId, "Waddles Notifications", NotificationManager.IMPORTANCE_HIGH).apply { description = "Sassy motivation from your duck"; val audioAttributes = AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).setUsage(AudioAttributes.USAGE_NOTIFICATION).build(); setSound(soundUri, audioAttributes); enableVibration(true) }
+        notificationManager.createNotificationChannel(channel)
+    }
+
+    val message = when {
+        progress == 0 -> listOf("It's getting late and you've done nothing. Quack your act together.", "Are we hibernating today? Get to work!", "I'm starving for productivity. Feed me some checked boxes!").random()
+        progress == 100 -> listOf("Wow, 100%? You actually did it. I'm mildly impressed.", "All tasks complete! You may now bask in my duckly glory.", "Perfection. I always knew you were my favorite.").random()
+        maxStreak >= 5 -> "You're on a $maxStreak-day streak! Don't let me down now."
+        progress > 50 -> "Halfway there. Keep waddling forward!"
+        else -> listOf("Stop scrolling and start doing.", "I'm watching you. Finish those tasks.", "A little effort goes a long way. Quack.").random()
+    }
+
+    val builder = NotificationCompat.Builder(context, channelId).setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("🦆 Waddles says...").setContentText(message).setPriority(NotificationCompat.PRIORITY_HIGH).setSound(soundUri).setAutoCancel(true)
+    notificationManager.notify(Random.nextInt(), builder.build())
+}
+
+// --- Components ---
+
+@Composable
+fun WaddlesApp(viewModel: WaddlesViewModel) {
+    val context = LocalContext.current
+    var hasNotificationPermission by remember { mutableStateOf(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED else true) }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted -> hasNotificationPermission = isGranted }
+    LaunchedEffect(Unit) { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }
+
+    var view by remember { mutableStateOf("daily") }
+    var selectedDate by remember { mutableStateOf(getTodayStr()) }
+
+    val tasks by viewModel.tasks.collectAsState()
+    val learningItems by viewModel.learningItems.collectAsState()
+    val timeLogs by viewModel.timeLogs.collectAsState()
+    val habits by viewModel.habits.collectAsState()
+
+    WaddlesTheme {
+        Scaffold(
+            bottomBar = {
+                NavigationBar(containerColor = Color.White) {
+                    NavigationBarItem(selected = view == "daily", onClick = { view = "daily" }, icon = { Icon(Icons.Default.CheckCircle, "Daily", tint = Color.Black) }, label = { Text("Daily", color = Color.Black, fontSize = 9.sp) })
+                    NavigationBarItem(selected = view == "weekly", onClick = { view = "weekly" }, icon = { Icon(Icons.Default.DateRange, "Weekly", tint = Color.Black) }, label = { Text("Weekly", color = Color.Black, fontSize = 9.sp) })
+                    NavigationBarItem(selected = view == "habits", onClick = { view = "habits" }, icon = { Icon(Icons.Default.Favorite, "Habits", tint = Color.Black) }, label = { Text("Habits", color = Color.Black, fontSize = 9.sp) })
+                    NavigationBarItem(selected = view == "learning", onClick = { view = "learning" }, icon = { Icon(Icons.Default.Menu, "Goals", tint = Color.Black) }, label = { Text("Goals", color = Color.Black, fontSize = 9.sp) })
+                    NavigationBarItem(selected = view == "stats", onClick = { view = "stats" }, icon = { Icon(Icons.Default.PlayArrow, "Tracker", tint = Color.Black) }, label = { Text("Tracker", color = Color.Black, fontSize = 9.sp) })
+                    NavigationBarItem(selected = view == "achievements", onClick = { view = "achievements" }, icon = { Icon(Icons.Default.Star, "Trophies", tint = Color.Black) }, label = { Text("Trophies", color = Color.Black, fontSize = 9.sp) })
+                }
+            }
+        ) { padding ->
+            Box(modifier = Modifier.padding(padding).fillMaxSize().background(Color(0xFF87CEEB))) {
+                when (view) {
+                    "daily" -> DailyView(tasks, habits, selectedDate, { selectedDate = it }, viewModel::toggleTask, viewModel::deleteTask, viewModel::addTask)
+                    "weekly" -> WeeklyView(tasks, viewModel::addTask, viewModel::deleteTask)
+                    "habits" -> HabitsTrackerView(habits, selectedDate, { selectedDate = it }, viewModel::addHabit, viewModel::toggleHabit, viewModel::deleteHabit)
+                    "learning" -> LearningTrackerView(learningItems = learningItems, addLearningItem = viewModel::addLearningItem, addLearningProgress = viewModel::addLearningProgress, planLearningToday = { item, planMode, units -> val taskText = if (planMode == "study") "Study Session: ${item.title}" else "Finish $units ${item.type}(s) of ${item.title}"; val actualUnits = if (planMode == "study") 0 else units; val safeCat = item.category ?: Category.Learning; viewModel.addTask(taskText, safeCat, getTodayStr(), item.id, actualUnits) })
+                    "stats" -> StatsTrackerView(viewModel, timeLogs, tasks, habits)
+                    "achievements" -> AchievementsView(learningItems)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DailyView(tasks: List<Task>, habits: List<Habit>, selectedDate: String, onSelectedDateChange: (String) -> Unit, toggleTask: (String) -> Unit, deleteTask: (String) -> Unit, addTask: (String, Category, String, String?, Int) -> Unit) {
+    val dailyTasks = tasks.filter { it.date == selectedDate }
+    val progress = if (dailyTasks.isEmpty()) 0 else (dailyTasks.count { it.completed } * 100 / dailyTasks.size)
+    val quote = MOTIVATIONAL_QUOTES[(LocalDate.parse(selectedDate).dayOfYear) % MOTIVATIONAL_QUOTES.size]
+    var newMiscTask by remember { mutableStateOf("") }
+    val context = LocalContext.current
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        item {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Column { Text(getDayName(selectedDate), fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text(LocalDate.parse(selectedDate).format(DateTimeFormatter.ofPattern("MMMM d")), color = Color.Black) }
+                IconButton(onClick = { val maxStreak = habits.maxOfOrNull { calculateHabitStreak(it.completedDates) } ?: 0; sendSassyWaddlesNotification(context, progress, maxStreak) }, modifier = Modifier.background(Color.White, CircleShape)) { Text("🦆", fontSize = 20.sp) }
+            }
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                IconButton(onClick = { onSelectedDateChange(LocalDate.parse(selectedDate).minusDays(1).toString()) }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Previous Day", tint = Color.Black) }
+                Button(onClick = { onSelectedDateChange(getTodayStr()) }, colors = ButtonDefaults.buttonColors(containerColor = Color.White)) { Text("Today", color = Color.Black) }
+                IconButton(onClick = { onSelectedDateChange(LocalDate.parse(selectedDate).plusDays(1).toString()) }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Next Day", tint = Color.Black) }
+            }
+        }
+        item { Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) { Column(modifier = Modifier.padding(16.dp)) { Text("\"${quote.text}\"", fontStyle = FontStyle.Italic, fontSize = 18.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth(), color = Color.Black); Text("— ${quote.author}", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center) } } }
+        item { Waddles(progress, "daily") }
+
+        items(Category.entries) { category ->
+            val categoryTasks = dailyTasks.filter { it.category == category }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(category.name.uppercase(), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = getCategoryColor(category), letterSpacing = 1.sp)
+                Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+                        if (categoryTasks.isEmpty() && category != Category.Miscellaneous) { Text("No tasks planned.", modifier = Modifier.padding(16.dp), color = Color.Black, fontStyle = FontStyle.Italic, fontSize = 14.sp) }
+                        categoryTasks.forEach { task ->
+                            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = { toggleTask(task.id) }) { Icon(if (task.completed) Icons.Default.CheckCircle else Icons.Default.AddCircle, contentDescription = "Toggle Task", tint = if (task.completed) getCategoryColor(category) else Color.LightGray) }
+                                Text(task.text, modifier = Modifier.weight(1f), textDecoration = if (task.completed) TextDecoration.LineThrough else null, color = Color.Black)
+                                if (task.category == Category.Miscellaneous) IconButton(onClick = { deleteTask(task.id) }) { Icon(Icons.Default.Delete, contentDescription = "Delete Task", tint = Color.LightGray) } else Spacer(modifier = Modifier.width(48.dp))
+                            }
+                        }
+                        if (category == Category.Miscellaneous) {
+                            Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                TextField(value = newMiscTask, onValueChange = { newMiscTask = it }, placeholder = { Text("Add Misc task...", color = Color.DarkGray) }, modifier = Modifier.weight(1f), colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White))
+                                IconButton(onClick = { addTask(newMiscTask, Category.Miscellaneous, selectedDate, null, 1); newMiscTask = "" }, modifier = Modifier.background(getCategoryColor(Category.Miscellaneous), RoundedCornerShape(8.dp))) { Icon(Icons.Default.Add, contentDescription = "Add Task", tint = Color.White) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HabitsTrackerView(habits: List<Habit>, selectedDate: String, onSelectedDateChange: (String) -> Unit, addHabit: (String) -> Unit, toggleHabit: (String, String) -> Unit, deleteHabit: (String) -> Unit) {
+    var newHabitName by remember { mutableStateOf("") }
+    val completedOnSelectedDateCount = habits.count { it.completedDates.contains(selectedDate) }
+    val progress = if (habits.isEmpty()) 0 else (completedOnSelectedDateCount * 100 / habits.size)
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        item { Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Column { Text("Habit Tracker", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text("Viewing habits for:", color = Color.Black); Text(LocalDate.parse(selectedDate).format(DateTimeFormatter.ofPattern("MMMM d")), color = Color.Black, fontWeight = FontWeight.Bold) } } }
+        item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { IconButton(onClick = { onSelectedDateChange(LocalDate.parse(selectedDate).minusDays(1).toString()) }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Previous Day", tint = Color.Black) }; Button(onClick = { onSelectedDateChange(getTodayStr()) }, colors = ButtonDefaults.buttonColors(containerColor = Color.White)) { Text("Today", color = Color.Black) }; IconButton(onClick = { onSelectedDateChange(LocalDate.parse(selectedDate).plusDays(1).toString()) }) { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Next Day", tint = Color.Black) } } }
+        item { Waddles(progress, "habits") }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Text("Form a New Habit", fontWeight = FontWeight.Bold, color = Color.Black)
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { TextField(value = newHabitName, onValueChange = { newHabitName = it }, placeholder = { Text("e.g. Drink 2L Water", color = Color.DarkGray) }, modifier = Modifier.weight(1f), colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White)); Spacer(modifier = Modifier.width(8.dp)); IconButton(onClick = { addHabit(newHabitName); newHabitName = "" }, modifier = Modifier.background(Color.Black, RoundedCornerShape(8.dp))) { Icon(Icons.Default.Add, contentDescription = "Add Habit", tint = Color.White) } }
+                }
+            }
+        }
+        items(habits) { habit ->
+            val isCompletedOnSelectedDate = habit.completedDates.contains(selectedDate)
+            val currentStreak = calculateHabitStreak(habit.completedDates)
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                Row(modifier = Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { toggleHabit(habit.id, selectedDate) }) { Icon(if (isCompletedOnSelectedDate) Icons.Default.CheckCircle else Icons.Default.AddCircle, contentDescription = "Toggle Habit", tint = if (isCompletedOnSelectedDate) Color(0xFF10B981) else Color.LightGray, modifier = Modifier.size(32.dp)) }
+                    Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) { Text(habit.name, fontWeight = FontWeight.Bold, color = Color.Black, textDecoration = if (isCompletedOnSelectedDate) TextDecoration.LineThrough else null); Spacer(modifier = Modifier.height(4.dp)); Row(verticalAlignment = Alignment.CenterVertically) { Text("🔥 ", fontSize = 14.sp); Text("$currentStreak Day Streak", fontSize = 12.sp, color = if (currentStreak > 0) Color(0xFFF58120) else Color.Gray, fontWeight = FontWeight.Bold) } }
+                    IconButton(onClick = { deleteHabit(habit.id) }) { Icon(Icons.Default.Delete, contentDescription = "Delete Habit", tint = Color.LightGray) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun WeeklyView(tasks: List<Task>, addTask: (String, Category, String, String?, Int) -> Unit, deleteTask: (String) -> Unit) {
+    val weekDates = getDatesOfCurrentWeek()
+    val initialDayIndex = weekDates.indexOf(getTodayStr()).takeIf { it >= 0 } ?: 0
+    var activeDayIndex by remember { mutableIntStateOf(initialDayIndex) }
+    var taskInput by remember { mutableStateOf("") }
+    var selectedCategory by remember { mutableStateOf(Category.Fitness) }
+    val weeklyTasks = tasks.filter { weekDates.contains(it.date) }
+    val progress = if (weeklyTasks.isEmpty()) 0 else (weeklyTasks.count { it.completed } * 100 / weeklyTasks.size)
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        item { Text("Weekly Setup", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text("Map out your growth pillars for the week.", color = Color.Black) }
+        item { Waddles(progress, "weekly") }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Text("Planning Controls", fontWeight = FontWeight.Bold, color = Color.Black)
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) { listOf("S", "M", "T", "W", "T", "F", "S").forEachIndexed { index, day -> Box(modifier = Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(if (activeDayIndex == index) Color.Black else Color(0xFFF4F4F5)).clickable { activeDayIndex = index }, contentAlignment = Alignment.Center) { Text(day, color = if (activeDayIndex == index) Color.White else Color.Black, fontWeight = FontWeight.Bold) } } }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { listOf(Category.Fitness, Category.Learning, Category.Hobbies).forEach { cat -> Button(onClick = { selectedCategory = cat }, contentPadding = PaddingValues(horizontal=8.dp), colors = ButtonDefaults.buttonColors(containerColor = if (selectedCategory == cat) getCategoryColor(cat) else Color.LightGray)) { Text(cat.name, color = if (selectedCategory == cat) Color.White else Color.Black, fontSize = 11.sp) } } }
+                    TextField(value = taskInput, onValueChange = { taskInput = it }, placeholder = { Text("e.g., Pull Day Workout", color = Color.DarkGray) }, modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White))
+                    Button(onClick = { addTask(taskInput, selectedCategory, weekDates[activeDayIndex], null, 1); taskInput = "" }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("Add to Schedule", color = Color.White) }
+                }
+            }
+        }
+        item {
+            Text("Planned for ${getDayName(weekDates[activeDayIndex])}", fontWeight = FontWeight.Bold, color = Color.Black)
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                val dayTasks = tasks.filter { it.date == weekDates[activeDayIndex] && it.category != Category.Miscellaneous }
+                if (dayTasks.isEmpty()) Box(modifier = Modifier.fillMaxWidth().padding(48.dp), contentAlignment = Alignment.Center) { Text("Nothing planned yet.", color = Color.Black) }
+                else Column { dayTasks.forEach { task -> Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(12.dp).clip(CircleShape).background(getCategoryColor(task.category))); Spacer(Modifier.width(12.dp)); Text(task.text, modifier = Modifier.weight(1f), color = Color.Black); IconButton(onClick = { deleteTask(task.id) }) { Icon(Icons.Default.Delete, contentDescription = "Delete Task", tint = Color.LightGray) } } } }
+            }
+        }
+    }
+}
+
+@Composable
+fun LearningTrackerView(learningItems: List<LearningItem>, addLearningItem: (String, Int, String, Category, String?) -> Unit, addLearningProgress: (String) -> Unit, planLearningToday: (LearningItem, String, Int) -> Unit) {
+    val activeGoals = learningItems.filter { it.completedUnits < it.totalUnits }
+    val totalUnits = activeGoals.sumOf { it.totalUnits }; val progress = if (totalUnits == 0) 0 else (activeGoals.sumOf { it.completedUnits } * 100 / totalUnits)
+    var title by remember { mutableStateOf("") }; var units by remember { mutableStateOf("1") }; var type by remember { mutableStateOf("Video") }; var selectedNewCategory by remember { mutableStateOf(Category.Learning) }
+    var hasDeadline by remember { mutableStateOf(false) }; var deadlineInput by remember { mutableStateOf(getTodayStr()) }
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        item { Text("Active Goals", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text("Map out your projects, unit by unit.", color = Color.Black) }
+        item { Waddles(progress, "learning") }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Text("Add a Course / Goal", fontWeight = FontWeight.Bold, color = Color.Black)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { Category.entries.forEach { cat -> Button(onClick = { selectedNewCategory = cat }, colors = ButtonDefaults.buttonColors(containerColor = if (selectedNewCategory == cat) getCategoryColor(cat) else Color.LightGray), contentPadding = PaddingValues(horizontal = 8.dp)) { Text(if (cat == Category.Miscellaneous) "Misc" else cat.name, color = if (selectedNewCategory == cat) Color.White else Color.Black, fontSize = 11.sp) } } }
+                    TextField(value = title, onValueChange = { title = it }, placeholder = { Text("Title (e.g. Master Kotlin)", color = Color.DarkGray) }, modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { TextField(value = units, onValueChange = { units = it }, placeholder = { Text("Total Units", color = Color.DarkGray) }, modifier = Modifier.weight(1f), colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White)); Column(verticalArrangement = Arrangement.spacedBy(4.dp)) { listOf("Video", "Chapter", "Project").forEach { t -> Row(verticalAlignment = Alignment.CenterVertically) { RadioButton(selected = type == t, onClick = { type = t }); Text(t, fontSize = 12.sp, color = Color.Black) } } } }
+                    Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(checked = hasDeadline, onCheckedChange = { hasDeadline = it }); Text("Add a deadline?", color = Color.Black, fontSize = 14.sp) }
+                    if (hasDeadline) { TextField(value = deadlineInput, onValueChange = { deadlineInput = it }, placeholder = { Text("YYYY-MM-DD") }, modifier = Modifier.fillMaxWidth(), label = { Text("Target Date (YYYY-MM-DD)", fontSize = 12.sp) }, colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White)) }
+                    Button(onClick = { val safeUnits = (units.toIntOrNull() ?: 1).coerceAtLeast(1); val finalDeadline = if (hasDeadline) deadlineInput else null; addLearningItem(title, safeUnits, type, selectedNewCategory, finalDeadline); title = ""; units = "1"; hasDeadline = false }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("Create Goal", color = Color.White) }
+                }
+            }
+        }
+        items(activeGoals) { item ->
+            var isPlanning by remember { mutableStateOf(false) }; var scheduleMode by remember { mutableStateOf("study") }; var unitsToPlan by remember { mutableStateOf("1") }
+            val safeCat = item.category ?: Category.Learning
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Column {
+                            Text(item.title, fontWeight = FontWeight.Bold, color = getCategoryColor(safeCat), fontSize = 18.sp);
+                            Text("${item.totalUnits} ${item.type}s • ${safeCat.name}", fontSize = 12.sp, color = Color.DarkGray);
+                            val daysLeft = getDaysRemaining(item.deadline)
+                            if (daysLeft != null) { Text(text = "⏳ $daysLeft", color = if (daysLeft.contains("Overdue")) Color.Red else Color(0xFFF58120), fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp)) }
+                        };
+                        IconButton(onClick = { addLearningProgress(item.id) }) { Icon(Icons.Default.AddCircle, contentDescription = "Add Progress", tint = getCategoryColor(safeCat), modifier = Modifier.size(32.dp)) }
+                    }
+                    if (item.totalUnits <= 50) { val unitList = (0 until item.totalUnits).toList(); val rows = unitList.chunked(12); Column(verticalArrangement = Arrangement.spacedBy(4.dp)) { rows.forEach { row -> Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) { row.forEach { index -> Box(modifier = Modifier.size(20.dp).clip(RoundedCornerShape(4.dp)).background(if (index < item.completedUnits) getCategoryColor(safeCat) else Color(0xFFE4E4E7))) } } } } } else { ProgressBar(label = "Progress", current = item.completedUnits, total = item.totalUnits, color = getCategoryColor(safeCat)) }
+                    Text("${item.completedUnits} / ${item.totalUnits} completed", fontSize = 12.sp, color = Color.Black); HorizontalDivider(color = Color.LightGray)
+                    if (!isPlanning) { TextButton(onClick = { isPlanning = true }, contentPadding = PaddingValues(0.dp)) { Icon(Icons.Default.DateRange, contentDescription = "Schedule", modifier = Modifier.size(16.dp), tint = Color.Black); Spacer(modifier = Modifier.width(4.dp)); Text("Schedule for Today", color = Color.Black, fontWeight = FontWeight.Bold) } } else {
+                        Column(modifier = Modifier.fillMaxWidth().background(Color(0xFFFAFAFA), RoundedCornerShape(8.dp)).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("What's the goal for today?", fontWeight = FontWeight.Bold, color = Color.Black)
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { scheduleMode = "study" }) { RadioButton(selected = scheduleMode == "study", onClick = { scheduleMode = "study" }); Text("Study Session", fontSize = 14.sp, color = Color.Black) }
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { scheduleMode = "complete" }) { RadioButton(selected = scheduleMode == "complete", onClick = { scheduleMode = "complete" }); Text("Finish Unit(s)", fontSize = 14.sp, color = Color.Black) }
+                            if (scheduleMode == "complete") { Row(verticalAlignment = Alignment.CenterVertically) { Text("How many?", fontSize = 12.sp, color = Color.DarkGray); Spacer(modifier = Modifier.width(8.dp)); TextField(value = unitsToPlan, onValueChange = { unitsToPlan = it }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.width(60.dp).height(48.dp), colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White)) } }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { TextButton(onClick = { isPlanning = false }) { Text("Cancel", color = Color.Gray) }; Button(onClick = { planLearningToday(item, scheduleMode, unitsToPlan.toIntOrNull() ?: 1); isPlanning = false }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("Add to Daily Task", color = Color.White) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AchievementsView(learningItems: List<LearningItem>) {
+    val completedGoals = learningItems.filter { it.completedUnits >= it.totalUnits }
+    val totalTrophies = completedGoals.size
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        item { Text("Trophy Room", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text("Your permanent hall of fame.", color = Color.Black) }
+
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("🏆 Mastery Level", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("$totalTrophies Trophies Unlocked", color = Color(0xFFFBBF24), fontSize = 24.sp, fontWeight = FontWeight.Black)
+                }
+            }
+        }
+
+        Category.entries.forEach { category ->
+            val categoryGoals = completedGoals.filter { it.category == category }
+            val (icon, title) = when(category) {
+                Category.Fitness -> "💪" to "Fitness Achievements"
+                Category.Learning -> "🧠" to "Career & Learning"
+                Category.Hobbies -> "🎨" to "Hobbies"
+                Category.Miscellaneous -> "🧩" to "Miscellaneous"
+            }
+
+            item {
+                Text("$icon $title", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = getCategoryColor(category))
+                if (categoryGoals.isEmpty()) {
+                    Text("No trophies here yet. Keep pushing!", color = Color.Gray, fontStyle = FontStyle.Italic, modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+
+            items(categoryGoals) { item ->
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFAFAFA)), border = BorderStroke(1.dp, getCategoryColor(category).copy(alpha=0.3f)), modifier = Modifier.padding(bottom = 8.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(48.dp).background(getCategoryColor(category).copy(alpha=0.1f), CircleShape), contentAlignment = Alignment.Center) { Text(icon, fontSize = 24.sp) }
+                        Spacer(Modifier.width(16.dp));
+                        Column { Text(item.title, fontWeight = FontWeight.Black, fontSize = 18.sp, color = Color.Black); Text("${item.totalUnits} ${item.type}s completed", fontSize = 12.sp, color = Color.DarkGray) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun StatsTrackerView(viewModel: WaddlesViewModel, timeLogs: List<TimeLog>, tasks: List<Task>, habits: List<Habit>) {
+    val context = LocalContext.current
+    var showSaveForm by remember { mutableStateOf(false) }
+    var showWrapUpDialog by remember { mutableStateOf(false) }
+    var showYearlyLogsDialog by remember { mutableStateOf(false) }
+    var showCheaterDialog by remember { mutableStateOf(false) }
+
+    val todaysIncompleteTasks = tasks.filter { it.date == getTodayStr() && !it.completed }
+    val categoryTasks = todaysIncompleteTasks.filter { it.category == viewModel.activeTimerCategory }
+
+    val activeTask = tasks.find { it.id == viewModel.activeTaskId }
+    val displayCategory = activeTask?.category ?: viewModel.activeTimerCategory
+
+    val currentMonth = LocalDate.now().monthValue; val currentYear = LocalDate.now().year
+    val monthlyLogs = timeLogs.filter { LocalDate.parse(it.date).monthValue == currentMonth && LocalDate.parse(it.date).year == currentYear }
+    val yearlyLogs = timeLogs.filter { LocalDate.parse(it.date).year == currentYear }
+    val monthlyCategoryTotals = Category.entries.associateWith { cat -> monthlyLogs.filter { it.category == cat }.map { it.hours }.sum() }
+    val yearlyCategoryTotals = Category.entries.associateWith { cat -> yearlyLogs.filter { it.category == cat }.map { it.hours }.sum() }
+
+    LaunchedEffect(activeTask?.completed) {
+        if (activeTask?.completed == true && viewModel.isTimerRunning) {
+            viewModel.toggleTimer(false, context)
+            if (viewModel.elapsedSeconds >= 300L) { viewModel.addTimeLog(activeTask.category, viewModel.elapsedSeconds / 3600f) }
+            viewModel.resetTimer()
+        }
+    }
+
+    if (showWrapUpDialog) WeeklyWrapUpDialog(timeLogs, tasks, habits, onDismiss = { showWrapUpDialog = false })
+    if (showYearlyLogsDialog) YearlyLogsDialog(yearlyLogs = yearlyLogs, onDismiss = { showYearlyLogsDialog = false })
+
+    if (showCheaterDialog) {
+        AlertDialog(onDismissRequest = { showCheaterDialog = false }, containerColor = Color.White, title = { Text("🦆 Waddles says...", fontWeight = FontWeight.Bold, color = Color.Black) }, text = { Text("Nice try. Less than 5 minutes doesn't count. Quack.", color = Color.Black, fontSize = 16.sp) }, confirmButton = { Button(onClick = { showCheaterDialog = false }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("Fine.", color = Color.White) } })
+    }
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+        item { Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Column { Text("Live Tracker", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text("Track your active focus sessions.", color = Color.Black) }; IconButton(onClick = { showWrapUpDialog = true }, modifier = Modifier.background(Color(0xFFFBBF24), CircleShape)) { Text("🎁", fontSize = 18.sp) } } }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.White), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Text("What are you working on?", fontWeight = FontWeight.Bold, color = Color.Black)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                        Category.entries.forEach { cat -> Button(onClick = { viewModel.activeTaskId = null; viewModel.activeTimerCategory = cat }, enabled = !viewModel.isTimerRunning && viewModel.elapsedSeconds == 0L, colors = ButtonDefaults.buttonColors(containerColor = if (viewModel.activeTaskId == null && viewModel.activeTimerCategory == cat) getCategoryColor(cat) else Color.LightGray, disabledContainerColor = if (viewModel.activeTaskId == null && viewModel.activeTimerCategory == cat) getCategoryColor(cat).copy(alpha = 0.5f) else Color(0xFFEEEEEE)), contentPadding = PaddingValues(horizontal = 8.dp)) { Text(if (cat == Category.Miscellaneous) "Misc" else cat.name, color = if (viewModel.activeTaskId == null && viewModel.activeTimerCategory == cat) Color.White else Color.Black, fontSize = 11.sp) } }
+                    }
+
+                    if (viewModel.elapsedSeconds == 0L && !viewModel.isTimerRunning) {
+                        if (categoryTasks.isNotEmpty()) {
+                            Text("Link a ${viewModel.activeTimerCategory.name} Task:", fontWeight = FontWeight.Bold, color = Color.DarkGray, fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
+                            Column(modifier = Modifier.fillMaxWidth().heightIn(max = 120.dp).verticalScroll(rememberScrollState())) {
+                                categoryTasks.forEach { task ->
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { if (viewModel.activeTaskId == task.id) viewModel.activeTaskId = null else { viewModel.activeTaskId = task.id; viewModel.activeTimerCategory = task.category } }.background(if (viewModel.activeTaskId == task.id) getCategoryColor(task.category).copy(alpha=0.1f) else Color.Transparent).padding(8.dp)) {
+                                        Icon(if (viewModel.activeTaskId == task.id) Icons.Default.CheckCircle else Icons.Default.AddCircle, contentDescription = "Select Task", tint = if (viewModel.activeTaskId == task.id) getCategoryColor(task.category) else Color.LightGray, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text(task.text, fontSize = 14.sp, color = Color.Black)
+                                    }
+                                }
+                            }
+                        } else { Text("No pending ${viewModel.activeTimerCategory.name} tasks today.", color = Color.Gray, fontStyle = FontStyle.Italic, fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp)) }
+                    } else if (activeTask != null) { Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().background(getCategoryColor(activeTask.category).copy(alpha=0.1f), RoundedCornerShape(8.dp)).padding(8.dp)) { Icon(Icons.Default.CheckCircle, contentDescription = "Active Task Locked", tint = getCategoryColor(activeTask.category), modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("Locked: ${activeTask.text}", fontSize = 14.sp, color = Color.Black, fontWeight = FontWeight.Bold) } }
+
+                    if (viewModel.elapsedSeconds == 0L && !viewModel.isTimerRunning) {
+                        Row(modifier = Modifier.background(Color(0xFFF4F4F5), RoundedCornerShape(24.dp))) {
+                            Button(onClick = { viewModel.isPomodoro = false }, colors = ButtonDefaults.buttonColors(containerColor = if (!viewModel.isPomodoro) Color.Black else Color.Transparent)) { Text("Stopwatch", color = if (!viewModel.isPomodoro) Color.White else Color.Gray) }
+                            Button(onClick = { viewModel.isPomodoro = true }, colors = ButtonDefaults.buttonColors(containerColor = if (viewModel.isPomodoro) Color.Black else Color.Transparent)) { Text("Pomodoro (25m)", color = if (viewModel.isPomodoro) Color.White else Color.Gray) }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    val displaySecs = if (viewModel.isPomodoro) (1500L - viewModel.elapsedSeconds).coerceAtLeast(0L) else viewModel.elapsedSeconds
+                    Text(text = formatTime(displaySecs), fontSize = 56.sp, fontWeight = FontWeight.Black, color = if (viewModel.isTimerRunning) getCategoryColor(displayCategory) else Color.Black, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+
+                    val handleSaveAttempt: (Boolean) -> Unit = { markTaskComplete ->
+                        if (viewModel.elapsedSeconds < 300L) { showCheaterDialog = true } else {
+                            viewModel.addTimeLog(displayCategory, viewModel.elapsedSeconds / 3600f)
+                            if (activeTask != null && markTaskComplete) viewModel.toggleTask(activeTask.id)
+                            viewModel.resetTimer()
+                            showSaveForm = false
+                        }
+                    }
+
+                    if (activeTask != null) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                            if (viewModel.elapsedSeconds == 0L && !viewModel.isTimerRunning) { Button(onClick = { viewModel.toggleTimer(true, context) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))) { Text("START", color = Color.White, fontWeight = FontWeight.Bold) }; Button(onClick = { viewModel.activeTaskId = null }, colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray)) { Text("CANCEL", color = Color.Black) } }
+                            else if (viewModel.isTimerRunning) { Button(onClick = { viewModel.toggleTimer(false, context) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B))) { Text("PAUSE", color = Color.White) }; Button(onClick = { handleSaveAttempt(true) }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("COMPLETE TASK", color = Color.White) } }
+                            else { Button(onClick = { viewModel.toggleTimer(true, context) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))) { Text("RESUME", color = Color.White) }; Button(onClick = { handleSaveAttempt(true) }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("COMPLETE TASK", color = Color.White) }; Button(onClick = { viewModel.resetTimer() }, colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray)) { Text("QUIT", color = Color.Black) } }
+                        }
+                    } else {
+                        AnimatedVisibility(visible = !showSaveForm) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                                if (viewModel.elapsedSeconds == 0L && !viewModel.isTimerRunning) Button(onClick = { viewModel.toggleTimer(true, context) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))) { Text("START", color = Color.White, fontWeight = FontWeight.Bold) }
+                                else if (viewModel.isTimerRunning) { Button(onClick = { viewModel.toggleTimer(false, context) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B))) { Text("PAUSE", color = Color.White) }; Button(onClick = { viewModel.toggleTimer(false, context); showSaveForm = true }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("STOP & SAVE", color = Color.White) } }
+                                else { Button(onClick = { viewModel.resetTimer() }, colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray)) { Text("RESET", color = Color.Black) }; Button(onClick = { viewModel.toggleTimer(true, context) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))) { Text("RESUME", color = Color.White) }; Button(onClick = { showSaveForm = true }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("SAVE", color = Color.White) } }
+                            }
+                        }
+                        AnimatedVisibility(visible = showSaveForm) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().background(Color(0xFFFAFAFA), RoundedCornerShape(8.dp)).padding(16.dp)) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = { showSaveForm = false }) { Text("Cancel", color = Color.Gray) }; Spacer(modifier = Modifier.width(8.dp)); Button(onClick = { handleSaveAttempt(false) }, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("LOG SESSION", color = Color.White) } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        item { Text("This Week's Focus", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.Black); Card(colors = CardDefaults.cardColors(containerColor = Color.White), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Column(modifier = Modifier.padding(16.dp)) { WeeklyBarChart(timeLogs = timeLogs) } } }
+        item { Text("Monthly Breakdown", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.Black); Card(colors = CardDefaults.cardColors(containerColor = Color.White), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Row(modifier = Modifier.padding(24.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { CategoryPieChart(data = monthlyCategoryTotals, modifier = Modifier.size(120.dp)); Spacer(modifier = Modifier.width(24.dp)); Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Category.entries.forEach { cat -> Row(verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(getCategoryColor(cat))); Spacer(modifier = Modifier.width(8.dp)); Text(cat.name, fontSize = 12.sp, color = Color.Black) } } } } } }
+        item { Text("Yearly Breakdown", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Color.Black); Card(colors = CardDefaults.cardColors(containerColor = Color.White), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Column(modifier = Modifier.padding(24.dp).fillMaxWidth()) { Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { CategoryPieChart(data = yearlyCategoryTotals, modifier = Modifier.size(120.dp)); Spacer(modifier = Modifier.width(24.dp)); Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Category.entries.forEach { cat -> Row(verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(getCategoryColor(cat))); Spacer(modifier = Modifier.width(8.dp)); Text(cat.name, fontSize = 12.sp, color = Color.Black) } } } }; Spacer(modifier = Modifier.height(24.dp)); Button(onClick = { showYearlyLogsDialog = true }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("View Yearly Log History", color = Color.White, fontWeight = FontWeight.Bold) } } } }
+    }
+}
+
+@Composable
+fun Waddles(progress: Int, type: String) {
+    val (title, subtitle, mood, progressColor) = when (type) {
+        "weekly" -> listOf("Weekly Waddles is waiting...", "Let's make this week legendary!", "excited", Color.Black)
+        "learning" -> listOf("Goals Waddles is growing...", "Ready to crush those big projects?", "happy", Color.Black)
+        "habits" -> listOf("Habit Waddles is building streaks...", "Keep the momentum going!", "excited", Color.Black)
+        "achievements" -> listOf("Waddles is proud of you!", "Look at everything you've conquered.", "excited", Color(0xFFFBBF24))
+        else -> listOf("Waddles is resting...", "Ready to start your day?", "sleep", Color.Black)
+    }
+
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp), colors = CardDefaults.cardColors(containerColor = Color.White), border = BorderStroke(1.dp, Color(0xFFE4E4E7)), shape = RoundedCornerShape(16.dp)) {
+        Box(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
+            Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                AnimatedDuck(mood = mood as String, type = type)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(text = title as String, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.Black)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(text = subtitle as String, fontSize = 14.sp, color = Color.Black)
+
+                if (type != "achievements") {
+                    Spacer(modifier = Modifier.height(40.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("${type.uppercase()} PROGRESS", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text("$progress %", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black) }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Box(modifier = Modifier.fillMaxWidth().height(12.dp).clip(CircleShape).background(Color(0xFFE4E4E7))) { Box(modifier = Modifier.fillMaxHeight().fillMaxWidth(progress / 100f).clip(CircleShape).background(progressColor as Color)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AnimatedDuck(mood: String, type: String) {
+    val infiniteTransition = rememberInfiniteTransition(label = "duck")
+    val duration = if (mood == "sleep") 3000 else 1500
+    val yTarget = when (mood) { "sleep" -> 5f; "happy" -> -5f; "excited" -> -10f; else -> -20f }
+    val yOffset by infiniteTransition.animateFloat(initialValue = 0f, targetValue = yTarget, animationSpec = infiniteRepeatable(animation = tween(duration / 2, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Reverse), label = "y")
+    val rotationTarget = if (mood == "excited") 5f else 0f
+    val rotation by infiniteTransition.animateFloat(initialValue = -rotationTarget, targetValue = rotationTarget, animationSpec = infiniteRepeatable(animation = tween(duration / 4, easing = LinearEasing), repeatMode = RepeatMode.Reverse), label = "rot")
+    val scaleTarget = if (mood == "sleep") 0.98f else 1f
+    val scale by infiniteTransition.animateFloat(initialValue = 1f, targetValue = scaleTarget, animationSpec = infiniteRepeatable(animation = tween(duration / 2), repeatMode = RepeatMode.Reverse), label = "scale")
+
+    Box(modifier = Modifier.size(100.dp).graphicsLayer { translationY = yOffset.dp.toPx(); rotationZ = rotation; scaleX = scale; scaleY = scale }) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width; val h = size.height
+            val headColor = Color(0xFF65A046); val bodyColor = Color(0xFFA26653); val wingColor = Color(0xFF754030); val beakColor = Color(0xFFF58120)
+            drawOval(color = Color.Black.copy(alpha = 0.1f), topLeft = Offset(w * 0.2f, h * 0.9f), size = Size(w * 0.6f, h * 0.1f))
+            drawLine(beakColor, start = Offset(w * 0.45f, h * 0.8f), end = Offset(w * 0.45f, h * 0.95f), strokeWidth = 5f, cap = StrokeCap.Round)
+            drawLine(beakColor, start = Offset(w * 0.45f, h * 0.95f), end = Offset(w * 0.35f, h * 0.95f), strokeWidth = 5f, cap = StrokeCap.Round)
+            drawLine(beakColor, start = Offset(w * 0.6f, h * 0.8f), end = Offset(w * 0.6f, h * 0.95f), strokeWidth = 5f, cap = StrokeCap.Round)
+            drawLine(beakColor, start = Offset(w * 0.6f, h * 0.95f), end = Offset(w * 0.5f, h * 0.95f), strokeWidth = 5f, cap = StrokeCap.Round)
+            val bodyPath = Path().apply { moveTo(w * 0.35f, h * 0.85f); quadraticTo(w * 0.15f, h * 0.85f, w * 0.25f, h * 0.45f); quadraticTo(w * 0.4f, h * 0.45f, w * 0.55f, h * 0.45f); quadraticTo(w * 0.95f, h * 0.45f, w * 0.95f, h * 0.65f); quadraticTo(w * 1.0f, h * 0.7f, w * 0.9f, h * 0.75f); quadraticTo(w * 0.75f, h * 0.85f, w * 0.35f, h * 0.85f); close() }
+            drawPath(bodyPath, bodyColor)
+            val headPath = Path().apply { moveTo(w * 0.25f, h * 0.45f); lineTo(w * 0.25f, h * 0.25f); quadraticTo(w * 0.25f, h * 0.05f, w * 0.4f, h * 0.05f); quadraticTo(w * 0.55f, h * 0.05f, w * 0.55f, h * 0.25f); lineTo(w * 0.55f, h * 0.45f); quadraticTo(w * 0.4f, h * 0.45f, w * 0.25f, h * 0.45f); close() }
+            drawPath(headPath, headColor)
+            val collarPath = Path().apply { moveTo(w * 0.25f, h * 0.43f); quadraticTo(w * 0.4f, h * 0.46f, w * 0.55f, h * 0.43f); lineTo(w * 0.55f, h * 0.47f); quadraticTo(w * 0.4f, h * 0.5f, w * 0.25f, h * 0.47f); close() }
+            drawPath(collarPath, Color.White)
+            val wingPath = Path().apply { moveTo(w * 0.5f, h * 0.55f); quadraticTo(w * 0.8f, h * 0.5f, w * 0.85f, h * 0.6f); quadraticTo(w * 0.9f, h * 0.75f, w * 0.65f, h * 0.75f); quadraticTo(w * 0.45f, h * 0.7f, w * 0.5f, h * 0.55f); close() }
+            drawPath(wingPath, wingColor)
+            val beakPath = Path().apply { moveTo(w * 0.26f, h * 0.22f); quadraticTo(w * 0.05f, h * 0.22f, w * 0.05f, h * 0.26f); quadraticTo(w * 0.05f, h * 0.32f, w * 0.26f, h * 0.3f); close() }
+            drawPath(beakPath, beakColor)
+            drawLine(Color.Black.copy(alpha=0.5f), start = Offset(w * 0.08f, h * 0.26f), end = Offset(w * 0.24f, h * 0.26f), strokeWidth = 2f, cap = StrokeCap.Round)
+
+            if (mood == "sleep") { val eyePath = Path().apply { moveTo(w * 0.32f, h * 0.2f); quadraticTo(w * 0.35f, h * 0.23f, w * 0.38f, h * 0.2f) }; drawPath(eyePath, color = Color.Black, style = Stroke(width = 3f, cap = StrokeCap.Round)) }
+            else drawCircle(Color.Black, radius = w * 0.03f, center = Offset(w * 0.35f, h * 0.2f))
+
+            if (type == "learning" || type == "habits") {
+                val sproutPath = Path().apply { moveTo(w * 0.4f, h * 0.05f); quadraticTo(w * 0.4f, h * -0.05f, w * 0.45f, h * -0.1f) }; drawPath(path = sproutPath, color = Color(0xFF10B981), style = Stroke(width = 4f, cap = StrokeCap.Round))
+                val leafPath = Path().apply { moveTo(w * 0.45f, h * -0.1f); quadraticTo(w * 0.55f, h * -0.15f, w * 0.6f, h * -0.1f); quadraticTo(w * 0.5f, h * -0.05f, w * 0.45f, h * -0.1f) }; drawPath(path = leafPath, color = Color(0xFF10B981))
+            } else if (type == "weekly") {
+                val bowPath = Path().apply { moveTo(w * 0.4f, h * 0.45f); lineTo(w * 0.3f, h * 0.35f); lineTo(w * 0.3f, h * 0.55f); close(); moveTo(w * 0.4f, h * 0.45f); lineTo(w * 0.5f, h * 0.35f); lineTo(w * 0.5f, h * 0.55f); close() }; drawPath(path = bowPath, color = Color(0xFFFBBF24)); drawCircle(Color.Yellow, radius = 6f, center = Offset(w * 0.4f, h * 0.45f))
+            } else if (type == "achievements") {
+                val crownPath = Path().apply { moveTo(w * 0.2f, h * 0.05f); lineTo(w * 0.25f, h * -0.15f); lineTo(w * 0.35f, h * -0.05f); lineTo(w * 0.45f, h * -0.2f); lineTo(w * 0.55f, h * -0.05f); lineTo(w * 0.65f, h * -0.15f); lineTo(w * 0.7f, h * 0.05f); close() }; drawPath(path = crownPath, color = Color(0xFFFBBF24))
+            }
+        }
+    }
+}
+
+@Composable
+fun ProgressBar(label: String, current: Int, total: Int, color: Color) {
+    val percentage = if (total == 0) 0 else (current * 100 / total)
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(text = label.uppercase(), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black); Text(text = "$percentage%", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black) }
+        Spacer(modifier = Modifier.height(6.dp))
+        Box(modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape).background(Color(0xFFE4E4E7))) { Box(modifier = Modifier.fillMaxHeight().fillMaxWidth(percentage / 100f).clip(CircleShape).background(color)) }
+    }
+}
+
+@Composable
+fun CategoryPieChart(data: Map<Category, Float>, modifier: Modifier = Modifier) {
+    val total = data.values.sum()
+    if (total == 0f) { Box(modifier = modifier.background(Color(0xFFE4E4E7), CircleShape), contentAlignment = Alignment.Center) { Text("No Data", color = Color.Gray, fontSize = 12.sp, fontWeight = FontWeight.Bold) }; return }
+    Canvas(modifier = modifier) {
+        var startAngle = -90f
+        data.forEach { (category, value) -> val sweepAngle = (value / total) * 360f; drawArc(color = getCategoryColor(category), startAngle = startAngle, sweepAngle = sweepAngle, useCenter = true, size = Size(size.width, size.height)); startAngle += sweepAngle }
+    }
+}
+
+@Composable
+fun WeeklyBarChart(timeLogs: List<TimeLog>) {
+    val weekDates = getDatesOfCurrentWeek()
+    val dailyTotals = weekDates.map { date -> date to timeLogs.filter { it.date == date }.map { it.hours }.sum() }
+    val maxHours = dailyTotals.maxOfOrNull { it.second }?.coerceAtLeast(0.5f) ?: 0.5f
+
+    Row(modifier = Modifier.fillMaxWidth().height(140.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.Bottom) {
+        dailyTotals.forEach { (date, hours) ->
+            val heightPercent = if (maxHours > 0) (hours / maxHours).coerceIn(0.02f, 1f) else 0.02f
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom, modifier = Modifier.fillMaxHeight()) {
+                Text(if (hours >= 0.05f) String.format(Locale.getDefault(), "%.1f", hours) else "", fontSize = 10.sp, color = Color.Gray)
+                Spacer(modifier = Modifier.height(4.dp))
+                Box(modifier = Modifier.width(28.dp).fillMaxHeight(heightPercent).clip(RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp)).background(if (date == getTodayStr()) Color.Black else Color.LightGray))
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(getDayName(date).take(3).uppercase(), fontSize = 10.sp, color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+fun WeeklyWrapUpDialog(timeLogs: List<TimeLog>, tasks: List<Task>, habits: List<Habit>, onDismiss: () -> Unit) {
+    val weekDates = getDatesOfCurrentWeek()
+    val weeklyLogs = timeLogs.filter { weekDates.contains(it.date) }; val weeklyTasks = tasks.filter { weekDates.contains(it.date) }
+    val totalHours = weeklyLogs.map { it.hours }.sum()
+    val completedTasks = weeklyTasks.count { it.completed }
+    val totalHabitsMaintained = habits.count { calculateHabitStreak(it.completedDates) >= 3 }
+
+    AlertDialog(
+        onDismissRequest = onDismiss, containerColor = Color.White,
+        title = { Text("🎉 Weekly Wrap-Up", fontWeight = FontWeight.Bold, color = Color.Black, fontSize = 24.sp) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Text("Here is a summary of your legendary week:", color = Color.DarkGray)
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF4F4F5))) {
+                    Column(modifier = Modifier.padding(16.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) { Text("⏱️ Focus Time:", fontWeight = FontWeight.Bold, color = Color.Black); Text(String.format(Locale.getDefault(), "%.1f hrs", totalHours), color = Color.Black) }
+                        Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) { Text("✅ Tasks Conquered:", fontWeight = FontWeight.Bold, color = Color.Black); Text("$completedTasks", color = Color.Black) }
+                        Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) { Text("🔥 Habits Maintained:", fontWeight = FontWeight.Bold, color = Color.Black); Text("$totalHabitsMaintained", color = Color.Black) }
+                    }
+                }
+                if (totalHours > 10) Text("Incredible focus this week! Waddles is proud.", color = Color(0xFF10B981), fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                else Text("A solid foundation. Let's build on this next week!", color = Color(0xFFF58120), fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+            }
+        },
+        confirmButton = { Button(onClick = onDismiss, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("Close", color = Color.White) } }
+    )
+}
+
+@Composable
+fun YearlyLogsDialog(yearlyLogs: List<TimeLog>, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss, containerColor = Color.White,
+        title = { Text("📅 Yearly Activities", fontWeight = FontWeight.Bold, color = Color.Black, fontSize = 20.sp) },
+        text = {
+            if (yearlyLogs.isEmpty()) Text("No activities logged this year yet. Start focusing!", color = Color.Gray)
+            else LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(yearlyLogs.sortedByDescending { it.date }) { log ->
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF4F4F5)), modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(log.category.name, fontWeight = FontWeight.Bold, color = getCategoryColor(log.category)); Text(String.format(Locale.getDefault(), "%.2f hrs", log.hours), color = Color.Black, fontWeight = FontWeight.Bold) }
+                            Text(log.date, fontSize = 10.sp, color = Color.Gray, modifier = Modifier.padding(top = 4.dp))
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = onDismiss, colors = ButtonDefaults.buttonColors(containerColor = Color.Black)) { Text("Close", color = Color.White) } }
+    )
+}
